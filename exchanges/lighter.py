@@ -268,8 +268,16 @@ class LighterClient(BaseExchangeClient):
             return OrderResult(success=True, order_id=str(order_params['client_order_index']))
 
     async def place_limit_order(self, contract_id: str, quantity: Decimal, price: Decimal,
-                                side: str) -> OrderResult:
-        """Place a post only order with Lighter using official SDK."""
+                                side: str, reduce_only: bool = False) -> OrderResult:
+        """Place a limit order with Lighter using official SDK.
+        
+        Args:
+            contract_id: Market index
+            quantity: Order quantity
+            price: Order price
+            side: Order side ('buy' or 'sell')
+            reduce_only: If True, order can only reduce position (for close orders)
+        """
         # Ensure client is initialized
         if self.lighter_client is None:
             await self._initialize_lighter_client()
@@ -295,7 +303,7 @@ class LighterClient(BaseExchangeClient):
             'is_ask': is_ask,
             'order_type': self.lighter_client.ORDER_TYPE_LIMIT,
             'time_in_force': self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-            'reduce_only': False,
+            'reduce_only': reduce_only,  # Set based on whether this is a close order
             'trigger_price': 0,
         }
 
@@ -341,11 +349,101 @@ class LighterClient(BaseExchangeClient):
                 active_close_orders += 1
         return active_close_orders
 
-    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, side: str) -> OrderResult:
-        """Place a close order with Lighter using official SDK."""
+    async def place_stop_loss_order(self, contract_id: str, quantity: Decimal, trigger_price: Decimal, 
+                                     side: str, execution_price: Optional[Decimal] = None, 
+                                     use_limit: bool = False) -> OrderResult:
+        """Place a stop loss order with Lighter using native stop loss order types.
+        
+        Args:
+            contract_id: Market index
+            quantity: Order quantity
+            trigger_price: Price that triggers the stop loss order
+            side: Order side ('buy' or 'sell')
+            execution_price: Execution price for limit stop loss (required if use_limit=True)
+            use_limit: If True, use ORDER_TYPE_STOP_LOSS_LIMIT, else use ORDER_TYPE_STOP_LOSS
+        
+        Returns:
+            OrderResult with order information
+        """
+        # Ensure client is initialized
+        if self.lighter_client is None:
+            await self._initialize_lighter_client()
+
+        # Determine order side
+        if side.lower() == 'buy':
+            is_ask = False
+        elif side.lower() == 'sell':
+            is_ask = True
+        else:
+            raise Exception(f"Invalid side: {side}")
+
+        # Generate unique client order index
+        client_order_index = int(time.time() * 1000) % 1000000  # Simple unique ID
+        self.current_order_client_id = client_order_index
+
+        # Determine order type
+        if use_limit:
+            if execution_price is None:
+                raise ValueError("execution_price is required when use_limit=True")
+            order_type = self.lighter_client.ORDER_TYPE_STOP_LOSS_LIMIT
+            price = int(execution_price * self.price_multiplier)
+        else:
+            order_type = self.lighter_client.ORDER_TYPE_STOP_LOSS
+            price = 0  # Market orders don't need price
+
+        # Create order parameters
+        order_params = {
+            'market_index': self.config.contract_id,
+            'client_order_index': client_order_index,
+            'base_amount': int(quantity * self.base_amount_multiplier),
+            'price': price,
+            'is_ask': is_ask,
+            'order_type': order_type,
+            'time_in_force': self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+            'reduce_only': True,  # Stop loss orders should be reduce_only
+            'trigger_price': int(trigger_price * self.price_multiplier),
+        }
+
+        order_result = await self._submit_order_with_retry(order_params)
+        
+        # wait for order to be placed
+        await asyncio.sleep(1)
+        
+        return order_result
+
+    async def place_close_order(self, contract_id: str, quantity: Decimal, price: Decimal, 
+                                side: str, use_stop_loss: bool = False, 
+                                trigger_price: Optional[Decimal] = None) -> OrderResult:
+        """Place a close order with Lighter using official SDK.
+        
+        Args:
+            contract_id: Market index
+            quantity: Order quantity
+            price: Order price (or execution price for stop loss limit orders)
+            side: Order side ('buy' or 'sell')
+            use_stop_loss: If True, use native stop loss order type
+            trigger_price: Trigger price for stop loss orders (required if use_stop_loss=True)
+        
+        Returns:
+            OrderResult with order information
+        """
         self.current_order = None
         self.current_order_client_id = None
-        order_result = await self.place_limit_order(contract_id, quantity, price, side)
+        
+        # If using native stop loss orders, use stop loss order method
+        if use_stop_loss and trigger_price is not None:
+            self.logger.log(f"[STOP_LOSS] Placing native stop loss order: trigger={trigger_price}, price={price}", "INFO")
+            # Use limit stop loss if price is provided, otherwise market stop loss
+            use_limit = (price is not None and price > 0)
+            order_result = await self.place_stop_loss_order(
+                contract_id, quantity, trigger_price, side, 
+                execution_price=price if use_limit else None, 
+                use_limit=use_limit
+            )
+        else:
+            # Use regular limit order with reduce_only=True for close orders (take profit)
+            # This ensures the order can only close positions, not open new ones
+            order_result = await self.place_limit_order(contract_id, quantity, price, side, reduce_only=True)
 
         # wait for 5 seconds to ensure order is placed
         await asyncio.sleep(5)

@@ -32,6 +32,7 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    stop_loss: Decimal
 
     @property
     def close_order_side(self) -> str:
@@ -73,6 +74,7 @@ class TradingBot:
 
         # Trading state
         self.active_close_orders = []
+        self.active_stop_loss_orders = []
         self.last_close_orders = 0
         self.last_open_order_time = 0
         self.last_log_time = 0
@@ -128,6 +130,41 @@ class TradingBot:
                     self.logger.log(f"[{order_type}] [{order_id}] {status} "
                                     f"{message.get('size')} @ {message.get('price')}", "INFO")
                     self.logger.log_transaction(order_id, side, message.get('size'), message.get('price'), status)
+                    
+                    # Handle stop loss order filled: cancel corresponding close order
+                    if status == 'FILLED' and order_type == "CLOSE":
+                        # Check if this is a stop loss order
+                        stop_loss_found = False
+                        for stop_loss_order in self.active_stop_loss_orders:
+                            if stop_loss_order.get('id') == order_id:
+                                # This is a stop loss order, find and cancel corresponding close order
+                                close_order_id = stop_loss_order.get('close_order_id')
+                                if close_order_id:
+                                    self.logger.log(f"[STOP_LOSS] Stop loss order {order_id} filled, canceling corresponding close order {close_order_id}", "WARNING")
+                                    # Schedule async cancel in event loop
+                                    if self.loop is not None:
+                                        asyncio.run_coroutine_threadsafe(
+                                            self._cancel_close_order_async(close_order_id),
+                                            self.loop
+                                        )
+                                stop_loss_found = True
+                                break
+                        
+                        # If this is a take-profit order (not stop loss), cancel corresponding stop loss order
+                        if not stop_loss_found:
+                            for stop_loss_order in self.active_stop_loss_orders:
+                                if stop_loss_order.get('close_order_id') == order_id:
+                                    # This is a take-profit order, cancel corresponding stop loss order
+                                    stop_loss_order_id = stop_loss_order.get('id')
+                                    if stop_loss_order_id:
+                                        self.logger.log(f"[TAKE_PROFIT] Take profit order {order_id} filled, canceling corresponding stop loss order {stop_loss_order_id}", "INFO")
+                                        # Schedule async cancel in event loop
+                                        if self.loop is not None:
+                                            asyncio.run_coroutine_threadsafe(
+                                                self._cancel_close_order_async(stop_loss_order_id),
+                                                self.loop
+                                            )
+                                    break
                 elif status == "CANCELED":
                     if order_type == "OPEN":
                         self.order_filled_amount = filled_size
@@ -159,6 +196,17 @@ class TradingBot:
 
         # Setup order update handler
         self.exchange_client.setup_order_update_handler(order_update_handler)
+
+    async def _cancel_close_order_async(self, order_id: str):
+        """Async helper to cancel close order when stop loss is triggered."""
+        try:
+            cancel_result = await self.exchange_client.cancel_order(order_id)
+            if cancel_result.success:
+                self.logger.log(f"[STOP_LOSS] Canceled close order {order_id}", "INFO")
+            else:
+                self.logger.log(f"[STOP_LOSS] Failed to cancel close order {order_id}: {cancel_result.error_message}", "WARNING")
+        except Exception as e:
+            self.logger.log(f"[STOP_LOSS] Error canceling close order {order_id}: {e}", "ERROR")
 
     def _calculate_wait_time(self) -> Decimal:
         """Calculate wait time between orders."""
@@ -258,6 +306,51 @@ class TradingBot:
                     self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
                     raise Exception(f"[CLOSE] Failed to place close order: {close_order_result.error_message}")
 
+                # Place stop loss order if stop_loss is enabled (default 0.02)
+                if self.config.stop_loss > 0:
+                    stop_loss_side = self.config.close_order_side
+                    if self.config.direction == 'buy':
+                        # For long positions, stop loss price is below filled price
+                        stop_loss_price = filled_price * (1 - self.config.stop_loss/100)
+                    else:
+                        # For short positions, stop loss price is above filled price
+                        stop_loss_price = filled_price * (1 + self.config.stop_loss/100)
+
+                    # For Lighter exchange, use native stop loss orders
+                    if self.config.exchange == "lighter":
+                        # Use native stop loss order with trigger price
+                        # For stop loss, trigger_price is the price that triggers the order
+                        # When price reaches trigger_price, the stop loss order becomes active
+                        stop_loss_order_result = await self.exchange_client.place_close_order(
+                            self.config.contract_id,
+                            self.config.quantity,
+                            stop_loss_price,  # execution price
+                            stop_loss_side,
+                            use_stop_loss=True,
+                            trigger_price=stop_loss_price  # trigger price (same as execution for limit stop loss)
+                        )
+                    else:
+                        # For other exchanges, use regular limit order (backward compatibility)
+                        stop_loss_order_result = await self.exchange_client.place_close_order(
+                            self.config.contract_id,
+                            self.config.quantity,
+                            stop_loss_price,
+                            stop_loss_side
+                        )
+                    
+                    if stop_loss_order_result.success:
+                        self.logger.log(f"[STOP_LOSS] Stop loss order placed: {stop_loss_order_result.order_id} @ {stop_loss_price}", "INFO")
+                        # Track stop loss order
+                        self.active_stop_loss_orders.append({
+                            'id': stop_loss_order_result.order_id,
+                            'price': stop_loss_price,
+                            'size': self.config.quantity,
+                            'filled_price': filled_price,
+                            'close_order_id': close_order_result.order_id
+                        })
+                    else:
+                        self.logger.log(f"[STOP_LOSS] Failed to place stop loss order: {stop_loss_order_result.error_message}", "WARNING")
+
                 return True
 
         else:
@@ -352,6 +445,49 @@ class TradingBot:
                     if self.config.exchange == "lighter":
                         await asyncio.sleep(1)
 
+                    # Place stop loss order if stop_loss is enabled (default 0.02)
+                    if self.config.stop_loss > 0 and close_order_result.success:
+                        stop_loss_side = self.config.close_order_side
+                        if self.config.direction == 'buy':
+                            # For long positions, stop loss price is below filled price
+                            stop_loss_price = filled_price * (1 - self.config.stop_loss/100)
+                        else:
+                            # For short positions, stop loss price is above filled price
+                            stop_loss_price = filled_price * (1 + self.config.stop_loss/100)
+
+                        # For Lighter exchange, use native stop loss orders
+                        if self.config.exchange == "lighter":
+                            # Use native stop loss order with trigger price
+                            stop_loss_order_result = await self.exchange_client.place_close_order(
+                                self.config.contract_id,
+                                self.order_filled_amount,
+                                stop_loss_price,  # execution price
+                                stop_loss_side,
+                                use_stop_loss=True,
+                                trigger_price=stop_loss_price  # trigger price
+                            )
+                        else:
+                            # For other exchanges, use regular limit order (backward compatibility)
+                            stop_loss_order_result = await self.exchange_client.place_close_order(
+                                self.config.contract_id,
+                                self.order_filled_amount,
+                                stop_loss_price,
+                                stop_loss_side
+                            )
+                        
+                        if stop_loss_order_result.success:
+                            self.logger.log(f"[STOP_LOSS] Stop loss order placed: {stop_loss_order_result.order_id} @ {stop_loss_price}", "INFO")
+                            # Track stop loss order
+                            self.active_stop_loss_orders.append({
+                                'id': stop_loss_order_result.order_id,
+                                'price': stop_loss_price,
+                                'size': self.order_filled_amount,
+                                'filled_price': filled_price,
+                                'close_order_id': close_order_result.order_id
+                            })
+                        else:
+                            self.logger.log(f"[STOP_LOSS] Failed to place stop loss order: {stop_loss_order_result.error_message}", "WARNING")
+
                 self.last_open_order_time = time.time()
                 if not close_order_result.success:
                     self.logger.log(f"[CLOSE] Failed to place close order: {close_order_result.error_message}", "ERROR")
@@ -368,15 +504,33 @@ class TradingBot:
                 # Get active orders
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
 
-                # Filter close orders
+                # Filter close orders and stop loss orders
                 self.active_close_orders = []
+                stop_loss_order_ids = {order['id'] for order in self.active_stop_loss_orders}
+                
                 for order in active_orders:
                     if order.side == self.config.close_order_side:
-                        self.active_close_orders.append({
-                            'id': order.order_id,
-                            'price': order.price,
-                            'size': order.size
-                        })
+                        # Only add to close_orders if it's not a stop loss order
+                        if order.order_id not in stop_loss_order_ids:
+                            self.active_close_orders.append({
+                                'id': order.order_id,
+                                'price': order.price,
+                                'size': order.size
+                            })
+                        else:
+                            # Update stop loss order if it still exists
+                            for stop_loss_order in self.active_stop_loss_orders:
+                                if stop_loss_order['id'] == order.order_id:
+                                    stop_loss_order['price'] = order.price
+                                    stop_loss_order['size'] = order.size
+                                    break
+                
+                # Remove stop loss orders that are no longer active
+                active_order_ids = {order.order_id for order in active_orders}
+                self.active_stop_loss_orders = [
+                    order for order in self.active_stop_loss_orders
+                    if order['id'] in active_order_ids
+                ]
 
                 # Get positions
                 position_amt = await self.exchange_client.get_account_positions()
@@ -505,6 +659,7 @@ class TradingBot:
             self.logger.log(f"Grid Step: {self.config.grid_step}%", "INFO")
             self.logger.log(f"Stop Price: {self.config.stop_price}", "INFO")
             self.logger.log(f"Pause Price: {self.config.pause_price}", "INFO")
+            self.logger.log(f"Stop Loss: {self.config.stop_loss}%", "INFO")
             self.logger.log(f"Boost Mode: {self.config.boost_mode}", "INFO")
             self.logger.log("=============================", "INFO")
 
@@ -521,15 +676,33 @@ class TradingBot:
                 # Update active orders
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
 
-                # Filter close orders
+                # Filter close orders and stop loss orders
                 self.active_close_orders = []
+                stop_loss_order_ids = {order['id'] for order in self.active_stop_loss_orders}
+                
                 for order in active_orders:
                     if order.side == self.config.close_order_side:
-                        self.active_close_orders.append({
-                            'id': order.order_id,
-                            'price': order.price,
-                            'size': order.size
-                        })
+                        # Only add to close_orders if it's not a stop loss order
+                        if order.order_id not in stop_loss_order_ids:
+                            self.active_close_orders.append({
+                                'id': order.order_id,
+                                'price': order.price,
+                                'size': order.size
+                            })
+                        else:
+                            # Update stop loss order if it still exists
+                            for stop_loss_order in self.active_stop_loss_orders:
+                                if stop_loss_order['id'] == order.order_id:
+                                    stop_loss_order['price'] = order.price
+                                    stop_loss_order['size'] = order.size
+                                    break
+                
+                # Remove stop loss orders that are no longer active
+                active_order_ids = {order.order_id for order in active_orders}
+                self.active_stop_loss_orders = [
+                    order for order in self.active_stop_loss_orders
+                    if order['id'] in active_order_ids
+                ]
 
                 # Periodic logging
                 mismatch_detected = await self._log_status_periodically()

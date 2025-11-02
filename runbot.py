@@ -47,6 +47,8 @@ def parse_arguments():
     parser.add_argument('--pause-price', type=Decimal, default=-1,
                         help='Pause trading and wait. Buy: pause if price >= pause-price.'
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
+    parser.add_argument('--stop-loss', type=Decimal, default=Decimal(0.02),
+                        help='Stop loss percentage (default: 0.02 for 0.02%%)')
     parser.add_argument('--boost', action='store_true',
                         help='Use the Boost mode for volume boosting')
 
@@ -116,7 +118,8 @@ async def main():
         grid_step=Decimal(args.grid_step),
         stop_price=Decimal(args.stop_price),
         pause_price=Decimal(args.pause_price),
-        boost_mode=args.boost
+        boost_mode=args.boost,
+        stop_loss=args.stop_loss
     )
 
     # Create and run the bot
